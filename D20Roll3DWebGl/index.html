@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>D20 Dice Roll Demo</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas {
+            display: block;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: #555;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            pointer-events: none;
+            text-shadow: 0 0 4px rgba(255,255,255,0.5);
+        }
+        #results {
+            position: absolute;
+            top: 10px;
+            right: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            align-items: flex-end;
+            pointer-events: none;
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+        .result-item {
+            background: rgba(30, 15, 60, 0.85);
+            color: #fff;
+            padding: 6px 16px;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: bold;
+            backdrop-filter: blur(6px);
+            border: 1px solid rgba(255,255,255,0.15);
+            transition: opacity 0.5s, transform 0.4s;
+            transform-origin: right center;
+        }
+        .result-item.latest {
+            font-size: 28px;
+            padding: 10px 22px;
+            background: rgba(60, 30, 120, 0.9);
+            border: 1px solid rgba(255,255,255,0.3);
+            box-shadow: 0 0 12px rgba(120, 80, 220, 0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="info">D20 Dice Roll — Drag to aim, scroll for depth, release to throw</div>
+    <div id="results"></div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.174.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.174.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { RapierPhysics } from 'three/addons/physics/RapierPhysics.js';
+
+        let camera, scene, renderer, physics;
+        let cube;
+        let thrown = false;
+        let pedestal, ground;
+        let arrow = null;
+        let settleTimer = 0;
+        let resultShown = false;
+        let resultPending = null; // face number waiting for camera alignment
+        let alignTimer = 0;
+        let awaitingRethrow = false; // after result shown, wait for click to rethrow
+        let holdInPlace = false; // freeze die in place until next throw
+        let spinAxis = new THREE.Vector3(0, 1, 0); // current spin axis
+        let spinAxisTarget = new THREE.Vector3(1, 0, 0); // target spin axis for smooth drift
+        let spinAxisTimer = 0; // frames until next target change
+        let idleQuat = new THREE.Quaternion(); // manually tracked rotation for idle state
+        let faceNormals = [];
+        let targetCamTheta = null; // target theta for text-readable alignment
+        const mouse = { startX: 0, startY: 0, startTime: 0, isDown: false, curX: 0, curY: 0, depth: 0 };
+        const orbit = { isDown: false, prevX: 0, prevY: 0 }; // right-click orbit
+
+        // --- Camera tracking state ---
+        const camState = {
+            phi: 75,          // polar angle in degrees (75=side, 10=top-down)
+            targetPhi: 75,
+            theta: 0,         // azimuthal angle in degrees
+            radius: 6,
+            prevPos: new THREE.Vector3(),
+            speed: 0,         // estimated die speed
+        };
+
+        init();
+
+        async function init() {
+            // --- Physics ---
+            physics = await RapierPhysics();
+
+            // --- Camera ---
+            camera = new THREE.PerspectiveCamera(
+                50,
+                window.innerWidth / window.innerHeight,
+                0.1,
+                200
+            );
+            camera.position.set(0, 5, 10);
+            camera.lookAt(0, 0, 0);
+
+            // --- Scene ---
+            scene = new THREE.Scene();
+            scene.background = generateStarryNightTexture();
+
+            // --- Lighting ---
+            // Hemisphere light for night ambience
+            const hemiLight = new THREE.HemisphereLight(0x8888cc, 0x444422, 1.0);
+            scene.add(hemiLight);
+
+            // Main directional light with shadows
+            const dirLight = new THREE.DirectionalLight(0xffffff, 3);
+            dirLight.position.set(5, 10, 7);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.left = -10;
+            dirLight.shadow.camera.right = 10;
+            dirLight.shadow.camera.top = 10;
+            dirLight.shadow.camera.bottom = -10;
+            dirLight.shadow.camera.near = 0.5;
+            dirLight.shadow.camera.far = 50;
+            dirLight.shadow.bias = -0.001;
+            scene.add(dirLight);
+
+            // Subtle secondary light for fill
+            const fillLight = new THREE.DirectionalLight(0x6688cc, 1.0);
+            fillLight.position.set(-3, 5, -4);
+            scene.add(fillLight);
+
+            // --- D20 Die ---
+            const { mesh: d20Mesh, normals: d20Normals } = createD20();
+            cube = d20Mesh;
+            cube.castShadow = true;
+            cube.receiveShadow = true;
+            cube.position.set(0, 0.5, 0);
+            faceNormals = d20Normals;
+            scene.add(cube);
+
+            // --- Invisible pedestal (holds cube position before throw) ---
+            const pedestalGeo = new THREE.BoxGeometry(2, 0.01, 2);
+            const pedestalMat = new THREE.MeshBasicMaterial({
+                visible: false
+            });
+            pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+            pedestal.position.set(0, 2.0, 0);
+            scene.add(pedestal);
+
+            // Position cube on invisible pedestal with random rotation
+            cube.position.set(0, 2.5, 0);
+            randomizeDieRotation();
+
+            // --- Ground (wood-textured surface where dice lands) ---
+            const groundGeometry = new THREE.BoxGeometry(100, 0.2, 100);
+            const woodTexture = generateWoodTexture();
+            const groundMaterial = new THREE.MeshStandardMaterial({
+                map: woodTexture,
+                roughness: 0.7,
+                metalness: 0.0
+            });
+            ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.position.y = -0.1; // top surface at y=0
+            ground.receiveShadow = true;
+            ground.userData.physics = { mass: 0 }; // static body
+            scene.add(ground);
+
+            // --- Register scene with physics ---
+            physics.addScene(scene);
+
+            // --- Renderer ---
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            renderer.setAnimationLoop(animate);
+            document.body.appendChild(renderer.domElement);
+
+            // --- Init camera tracking ---
+            camState.prevPos.copy(cube.position);
+
+            // --- Handle resize ---
+            window.addEventListener('resize', onWindowResize);
+
+            // --- Mouse tracking for swipe-throw (LMB) and orbit (RMB) ---
+            document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+            document.addEventListener('mousedown', (e) => {
+                if (e.button === 2) {
+                    // Right-click: orbit camera
+                    orbit.isDown = true;
+                    orbit.prevX = e.clientX;
+                    orbit.prevY = e.clientY;
+                    return;
+                }
+                if (e.button !== 0) return;
+
+                // After result shown, click to prepare new throw
+                if (awaitingRethrow) {
+                    awaitingRethrow = false;
+                    resultShown = false;
+                    resultPending = null;
+                    alignTimer = 0;
+                    settleTimer = 0;
+                    targetCamTheta = null;
+                    // Reset die to elevated position and freeze it
+                    const startPos = new THREE.Vector3(0, 2.5, 0);
+                    physics.setMeshPosition(cube, startPos);
+                    physics.setMeshVelocity(cube, new THREE.Vector3(0, 0, 0));
+                    randomizeDieRotation();
+                    camState.targetPhi = 75;
+                    camState.phi = 75;
+                    camState.theta = 0;
+                    camState.radius = 6;
+                    // Keep freezing velocity each frame until next throw
+                    holdInPlace = true;
+                }
+
+                mouse.startX = e.clientX;
+                mouse.startY = e.clientY;
+                mouse.curX = e.clientX;
+                mouse.curY = e.clientY;
+                mouse.depth = 0;
+                mouse.startTime = performance.now();
+                mouse.isDown = true;
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (orbit.isDown) {
+                    const dx = e.clientX - orbit.prevX;
+                    const dy = e.clientY - orbit.prevY;
+                    camState.theta += dx * 0.3;
+                    camState.phi = THREE.MathUtils.clamp(camState.phi - dy * 0.3, 5, 85);
+                    orbit.prevX = e.clientX;
+                    orbit.prevY = e.clientY;
+                    return;
+                }
+                if (!mouse.isDown) return;
+                mouse.curX = e.clientX;
+                mouse.curY = e.clientY;
+                update3DArrow();
+            });
+
+            document.addEventListener('wheel', (e) => {
+                if (orbit.isDown || !mouse.isDown) {
+                    // Scroll to zoom when orbiting or idle
+                    camState.radius = THREE.MathUtils.clamp(camState.radius - e.deltaY * 0.005, 3, 20);
+                    return;
+                }
+                e.preventDefault();
+                mouse.depth += e.deltaY * 0.01;
+                mouse.depth = THREE.MathUtils.clamp(mouse.depth, -5, 5);
+                update3DArrow();
+            }, { passive: false });
+
+            document.addEventListener('mouseup', (e) => {
+                if (e.button === 2) {
+                    orbit.isDown = false;
+                    return;
+                }
+                if (!mouse.isDown) return;
+                mouse.isDown = false;
+                // Remove 3D arrow
+                if (arrow) {
+                    scene.remove(arrow);
+                    arrow = null;
+                }
+                const dt = Math.max((performance.now() - mouse.startTime) / 1000, 0.016);
+                const dx = e.clientX - mouse.startX;
+                const dy = e.clientY - mouse.startY;
+                const dz = mouse.depth;
+                // Ignore tiny drags
+                if (Math.sqrt(dx * dx + dy * dy + dz * dz * 10000) < 10) return;
+                throwDice(dx, dy, dz, dt);
+            });
+        }
+
+        // Get camera-relative world direction from screen drag
+        function screenToWorldDir(screenDx, screenDy, scrollDepth) {
+            // Use actual camera right and up vectors (works for any camera angle)
+            const right = new THREE.Vector3();
+            const up = new THREE.Vector3();
+            const forward = new THREE.Vector3();
+            right.setFromMatrixColumn(camera.matrixWorld, 0);   // camera X = right
+            up.setFromMatrixColumn(camera.matrixWorld, 1);       // camera Y = up
+            camera.getWorldDirection(forward);                    // camera -Z = forward (into screen)
+
+            // screen drag right → camera right, screen drag up → camera up
+            const worldDir = new THREE.Vector3();
+            worldDir.addScaledVector(right, screenDx);
+            worldDir.addScaledVector(up, -screenDy);             // screen Y inverted
+            worldDir.addScaledVector(forward, scrollDepth * 80); // scroll = depth into screen
+
+            return worldDir;
+        }
+
+        function update3DArrow() {
+            // Remove old arrow
+            if (arrow) {
+                scene.remove(arrow);
+                arrow = null;
+            }
+
+            const screenDx = mouse.curX - mouse.startX;
+            const screenDy = mouse.curY - mouse.startY;
+
+            const worldDir = screenToWorldDir(screenDx, screenDy, mouse.depth);
+            // Keep Y proportional to drag (upward drag = upward arrow, downward = downward)
+
+            const length = worldDir.length() / 80;
+            if (length < 0.1) return;
+
+            const dir = worldDir.normalize();
+
+            const origin = cube.position.clone();
+            arrow = new THREE.ArrowHelper(
+                dir, origin,
+                Math.min(length, 5),
+                0xff2222,
+                Math.min(length * 0.25, 0.6),
+                0.3
+            );
+            scene.add(arrow);
+        }
+
+        function throwDice(dx, dy, dz, dt) {
+            // On first throw, register cube with physics as dynamic body
+            if (!thrown) {
+                thrown = true;
+                physics.addMesh(cube, 1, 0.4);
+                // Remove pedestal
+                if (pedestal) {
+                    scene.remove(pedestal);
+                    pedestal = null;
+                }
+                // Need multiple frames for Rapier to fully register the body
+                setTimeout(() => {
+                    applyThrowVelocity(dx, dy, dz, dt);
+                }, 100);
+                return;
+            }
+
+            // For re-throws, first reset position, then apply velocity next frame
+            holdInPlace = false;
+            const startPos = new THREE.Vector3(0, 2.5, 0);
+            physics.setMeshPosition(cube, startPos);
+            randomizeDieRotation();
+            requestAnimationFrame(() => {
+                applyThrowVelocity(dx, dy, dz, dt);
+            });
+        }
+
+        function applyThrowVelocity(dx, dy, dz, dt) {
+            // Use camera-relative mapping (same as arrow)
+            const worldDir = screenToWorldDir(dx, dy, dz);
+
+            // Swipe speed
+            const swipeLen = Math.sqrt(dx * dx + dy * dy);
+            const swipeSpeed = Math.min(swipeLen / dt, 3000);
+            const speedFactor = THREE.MathUtils.clamp(swipeSpeed / 1500, 0.3, 1.0);
+
+            // Scale world direction to velocity
+            const scale = 0.15 * speedFactor;
+            const vx = worldDir.x * scale + (Math.random() - 0.5) * 2;
+            const vz = worldDir.z * scale + (Math.random() - 0.5) * 2;
+            const vy = 1 + speedFactor * 3; // upward arc
+
+            const velocity = new THREE.Vector3(vx, vy, vz);
+            physics.setMeshVelocity(cube, velocity);
+
+            // Allow new result detection
+            resultShown = false;
+            resultPending = null;
+            alignTimer = 0;
+            settleTimer = 0;
+            targetCamTheta = null;
+
+            // Reset camera to side-view for action shot
+            camState.targetPhi = 75;
+            camState.phi = 75;
+        }
+
+        function randomizeDieRotation() {
+            const q = new THREE.Quaternion();
+            q.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+            cube.quaternion.copy(q);
+            idleQuat.copy(q);
+            // Pick a new random spin axis for idle rotation
+            spinAxis.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            // Hold die in place between throws (counteract gravity)
+            if (holdInPlace && thrown) {
+                physics.setMeshPosition(cube, new THREE.Vector3(0, 2.5, 0));
+                physics.setMeshVelocity(cube, new THREE.Vector3(0, 0, 0));
+            }
+
+            // Idle spin when not in flight (before first throw or between throws)
+            if (!thrown || holdInPlace) {
+                // Smoothly drift spin axis toward random targets
+                spinAxisTimer--;
+                if (spinAxisTimer <= 0) {
+                    spinAxisTarget.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+                    spinAxisTimer = 120 + Math.floor(Math.random() * 180); // 2-5 sec
+                }
+                spinAxis.lerp(spinAxisTarget, 0.02).normalize();
+
+                // Use idleQuat to track rotation manually (physics overwrites cube.quaternion)
+                const spinQ = new THREE.Quaternion().setFromAxisAngle(spinAxis, 0.024);
+                idleQuat.premultiply(spinQ);
+                cube.quaternion.copy(idleQuat);
+
+                const target = cube.position.clone();
+                target.y = Math.max(target.y, 0.5);
+                const phiRad = THREE.MathUtils.degToRad(camState.phi);
+                const thetaRad = THREE.MathUtils.degToRad(camState.theta);
+                camera.position.set(
+                    target.x + camState.radius * Math.sin(phiRad) * Math.cos(thetaRad),
+                    target.y + camState.radius * Math.cos(phiRad),
+                    target.z + camState.radius * Math.sin(phiRad) * Math.sin(thetaRad)
+                );
+                camera.lookAt(target);
+                renderer.render(scene, camera);
+                return;
+            }
+
+            // --- Track die velocity ---
+            // Only update speed when physics actually stepped (position changed).
+            // Between physics steps cube.position is constant, so delta=0 — setting
+            // speed=0 every non-physics frame causes phi/theta to oscillate wildly.
+            const delta = cube.position.clone().sub(camState.prevPos);
+            const dist = delta.length();
+            if (dist > 1e-6) {
+                // Physics stepped — real movement
+                camState.speed = dist;
+                camState.prevPos.copy(cube.position);
+            } else {
+                // No physics step this render frame — gently decay speed
+                camState.speed *= 0.95;
+            }
+
+            // --- Map speed to target phi ---
+            // High speed → 75° (side view), zero speed → 10° (top-down)
+            const speedThreshold = 0.01;
+            const maxSpeed = 0.15;
+            const t = THREE.MathUtils.clamp(
+                (camState.speed - speedThreshold) / (maxSpeed - speedThreshold),
+                0, 1
+            );
+            camState.targetPhi = THREE.MathUtils.lerp(10, 75, t);
+
+            // Smoothly interpolate phi toward target
+            camState.phi = THREE.MathUtils.lerp(camState.phi, camState.targetPhi, 0.03);
+
+            // Slowly rotate azimuth only while die is moving
+            if (camState.speed > 0.01) {
+                camState.theta += 0.15;
+                targetCamTheta = null;
+            } else if (targetCamTheta !== null) {
+                // Smoothly rotate to readable angle
+                let diff = targetCamTheta - camState.theta;
+                // Normalize to [-180, 180]
+                while (diff > 180) diff -= 360;
+                while (diff < -180) diff += 360;
+                camState.theta += diff * 0.04;
+            }
+
+            // --- Compute camera position in spherical coords around the die ---
+            const phiRad = THREE.MathUtils.degToRad(camState.phi);
+            const thetaRad = THREE.MathUtils.degToRad(camState.theta);
+
+            const target = cube.position.clone();
+            target.y = Math.max(target.y, 0.5); // don't look underground
+
+            camera.position.set(
+                target.x + camState.radius * Math.sin(phiRad) * Math.cos(thetaRad),
+                target.y + camState.radius * Math.cos(phiRad),
+                target.z + camState.radius * Math.sin(phiRad) * Math.sin(thetaRad)
+            );
+            camera.lookAt(target);
+
+            // --- Out of bounds detection ---
+            if (thrown && !holdInPlace) {
+                const p = cube.position;
+                if (p.y < -5) {
+                    // Die fell off the table — mark as void and reset like a rethrow
+                    addResultToPanel('—');
+                    resultShown = false;
+                    resultPending = null;
+                    settleTimer = 0;
+                    alignTimer = 0;
+                    targetCamTheta = null;
+                    awaitingRethrow = false;
+                    // Reset die to elevated position and freeze it
+                    physics.setMeshPosition(cube, new THREE.Vector3(0, 2.5, 0));
+                    physics.setMeshVelocity(cube, new THREE.Vector3(0, 0, 0));
+                    randomizeDieRotation();
+                    camState.targetPhi = 75;
+                    camState.phi = 75;
+                    camState.theta = 0;
+                    camState.radius = 6;
+                    holdInPlace = true;
+                }
+            }
+
+            // --- Settle detection ---
+            if (!resultShown && thrown) {
+                if (camState.speed < 0.002) {
+                    settleTimer++;
+                    if (settleTimer > 60 && resultPending === null) {
+                        // Phase 1: start camera alignment
+                        const topFace = getTopFace();
+                        resultPending = topFace;
+                        targetCamTheta = computeReadableTheta(topFace - 1);
+                        alignTimer = 0;
+                    }
+                    if (resultPending !== null) {
+                        alignTimer++;
+                        // Phase 2: after camera has had time to align (~1.5 sec)
+                        if (alignTimer > 90) {
+                            resultShown = true;
+                            awaitingRethrow = true;
+                            addResultToPanel(resultPending);
+                            resultPending = null;
+                        }
+                    }
+                } else {
+                    settleTimer = 0;
+                    resultPending = null;
+                    alignTimer = 0;
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- D20 Creation ---
+        function createD20() {
+            // Standard d20 face-number-to-opposite mapping:
+            // Face i (0-indexed) gets number (i+1), opposite face gets (21 - (i+1))
+            const icosa = new THREE.IcosahedronGeometry(1, 0);
+            const posAttr = icosa.getAttribute('position');
+            const indexAttr = icosa.index;
+
+            // Compute face normals and store them
+            const normals = [];
+            const faceCount = indexAttr ? indexAttr.count / 3 : posAttr.count / 3;
+
+            const vA = new THREE.Vector3();
+            const vB = new THREE.Vector3();
+            const vC = new THREE.Vector3();
+            const cb = new THREE.Vector3();
+            const ab = new THREE.Vector3();
+
+            for (let f = 0; f < faceCount; f++) {
+                let a, b, c;
+                if (indexAttr) {
+                    a = indexAttr.getX(f * 3);
+                    b = indexAttr.getX(f * 3 + 1);
+                    c = indexAttr.getX(f * 3 + 2);
+                } else {
+                    a = f * 3; b = f * 3 + 1; c = f * 3 + 2;
+                }
+                vA.fromBufferAttribute(posAttr, a);
+                vB.fromBufferAttribute(posAttr, b);
+                vC.fromBufferAttribute(posAttr, c);
+
+                cb.subVectors(vC, vB);
+                ab.subVectors(vA, vB);
+                cb.cross(ab).normalize();
+
+                normals.push(cb.clone());
+            }
+
+            // Create non-indexed geometry for per-face materials
+            const geo = icosa.toNonIndexed();
+            // Recompute normals so each face gets a flat normal (fixes inconsistent edge thickness)
+            geo.computeVertexNormals();
+            // Override type so RapierPhysics uses convex hull instead of sphere
+            Object.defineProperty(geo, 'type', { value: 'BufferGeometry' });
+
+            // Assign UV coords for each triangular face
+            const uvs = [];
+            for (let f = 0; f < faceCount; f++) {
+                // Equilateral triangle UVs centered in unit square
+                uvs.push(0.5, 1.0);   // top center
+                uvs.push(0.0, 0.0);   // bottom left
+                uvs.push(1.0, 0.0);   // bottom right
+            }
+            geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+
+            // Add material groups (one per face)
+            geo.clearGroups();
+            for (let f = 0; f < faceCount; f++) {
+                geo.addGroup(f * 3, 3, f);
+            }
+
+            // Create materials with numbered canvas textures
+            const materials = [];
+            for (let f = 0; f < faceCount; f++) {
+                const num = f + 1;
+                const canvas = document.createElement('canvas');
+                canvas.width = 256;
+                canvas.height = 256;
+                const ctx = canvas.getContext('2d');
+
+                // Background — single solid color, no inner triangle
+                ctx.fillStyle = '#3a2a6a';
+                ctx.fillRect(0, 0, 256, 256);
+
+                // Glowing number
+                ctx.save();
+                ctx.shadowColor = '#88ccff';
+                ctx.shadowBlur = 20;
+                ctx.fillStyle = '#aaddff';
+                ctx.font = 'bold 70px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                // Draw twice for stronger glow
+                ctx.fillText(String(num), 128, 140);
+                ctx.shadowBlur = 40;
+                ctx.shadowColor = '#4488ff';
+                ctx.fillText(String(num), 128, 140);
+                ctx.restore();
+
+                // Bright core
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 70px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(String(num), 128, 140);
+
+                // Underline for 6 and 9
+                if (num === 6 || num === 9) {
+                    ctx.save();
+                    ctx.shadowColor = '#88ccff';
+                    ctx.shadowBlur = 15;
+                    ctx.fillStyle = '#aaddff';
+                    ctx.fillRect(95, 185, 66, 5);
+                    ctx.restore();
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(95, 185, 66, 5);
+                }
+
+                const texture = new THREE.CanvasTexture(canvas);
+                texture.colorSpace = THREE.SRGBColorSpace;
+                materials.push(new THREE.MeshStandardMaterial({
+                    map: texture,
+                    roughness: 0.3,
+                    metalness: 0.5,
+                    flatShading: true
+                }));
+            }
+
+            const mesh = new THREE.Mesh(geo, materials);
+
+            return { mesh, normals };
+        }
+
+        // --- Detect top face ---
+        function getTopFace() {
+            const quat = new THREE.Quaternion();
+            cube.getWorldQuaternion(quat);
+
+            let maxY = -Infinity;
+            let topIndex = 0;
+
+            for (let i = 0; i < faceNormals.length; i++) {
+                const worldNormal = faceNormals[i].clone().applyQuaternion(quat);
+                if (worldNormal.y > maxY) {
+                    maxY = worldNormal.y;
+                    topIndex = i;
+                }
+            }
+
+            return topIndex + 1; // 1-based face number
+        }
+
+        // Compute camera theta (degrees) so that when looking down at the top face,
+        // the text on that face appears right-side-up
+        function computeReadableTheta(faceIndex) {
+            const quat = new THREE.Quaternion();
+            cube.getWorldQuaternion(quat);
+
+            // Get the face's local "up" direction for text
+            // For an equilateral triangle face, vertex 0 is the "top" of the text
+            const geo = cube.geometry;
+            const posAttr = geo.getAttribute('position');
+
+            // Get vertices of this face (non-indexed, 3 verts per face)
+            const v0 = new THREE.Vector3().fromBufferAttribute(posAttr, faceIndex * 3);
+            const v1 = new THREE.Vector3().fromBufferAttribute(posAttr, faceIndex * 3 + 1);
+            const v2 = new THREE.Vector3().fromBufferAttribute(posAttr, faceIndex * 3 + 2);
+
+            // Face center
+            const center = new THREE.Vector3().addVectors(v0, v1).add(v2).divideScalar(3);
+
+            // "Text up" direction: from center toward vertex 0 (top of triangle)
+            const textUp = new THREE.Vector3().subVectors(v0, center).normalize();
+
+            // Transform to world space
+            textUp.applyQuaternion(quat);
+
+            // Project onto XZ plane (we're looking down, so text-up should point "away" from camera)
+            const textUpXZ = new THREE.Vector2(textUp.x, textUp.z).normalize();
+
+            // Camera offset from target on XZ = (cos(theta), sin(theta))
+            // Camera forward on XZ = (-cos(theta), -sin(theta))
+            // For readable text, textUp should align with camera forward
+            // So cos(theta) = -tx, sin(theta) = -tz → theta = atan2(-tz, -tx)
+            const theta = THREE.MathUtils.radToDeg(Math.atan2(-textUpXZ.y, -textUpXZ.x));
+            return theta;
+        }
+
+        // --- Generate starry night sky texture ---
+        function generateStarryNightTexture() {
+            const size = 2048;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+
+            // Deep night sky gradient
+            const grad = ctx.createLinearGradient(0, 0, 0, size);
+            grad.addColorStop(0, '#000510');
+            grad.addColorStop(0.3, '#050a20');
+            grad.addColorStop(0.6, '#0a0f2a');
+            grad.addColorStop(1, '#0f1535');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, size, size);
+
+            // Subtle nebula clouds
+            for (let n = 0; n < 5; n++) {
+                const nx = Math.random() * size;
+                const ny = Math.random() * size;
+                const nr = 200 + Math.random() * 300;
+                const nebGrad = ctx.createRadialGradient(nx, ny, 0, nx, ny, nr);
+                const hue = Math.floor(200 + Math.random() * 80); // blue-purple
+                nebGrad.addColorStop(0, `hsla(${hue}, 60%, 20%, 0.08)`);
+                nebGrad.addColorStop(0.5, `hsla(${hue}, 50%, 15%, 0.04)`);
+                nebGrad.addColorStop(1, 'transparent');
+                ctx.fillStyle = nebGrad;
+                ctx.fillRect(0, 0, size, size);
+            }
+
+            // Stars
+            for (let i = 0; i < 2000; i++) {
+                const x = Math.random() * size;
+                const y = Math.random() * size;
+                const r = Math.random();
+
+                if (r < 0.85) {
+                    // Small dim stars
+                    const brightness = 100 + Math.floor(Math.random() * 155);
+                    ctx.fillStyle = `rgba(${brightness}, ${brightness}, ${Math.min(255, brightness + 40)}, ${0.4 + Math.random() * 0.6})`;
+                    ctx.fillRect(x, y, 1, 1);
+                } else if (r < 0.97) {
+                    // Medium stars with slight glow
+                    ctx.save();
+                    ctx.shadowColor = '#aaccff';
+                    ctx.shadowBlur = 3 + Math.random() * 4;
+                    ctx.fillStyle = '#ddeeff';
+                    ctx.beginPath();
+                    ctx.arc(x, y, 0.8 + Math.random() * 0.7, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.restore();
+                } else {
+                    // Bright stars with strong glow
+                    const colors = ['#ffffff', '#ffeedd', '#aaccff', '#ffccaa'];
+                    const col = colors[Math.floor(Math.random() * colors.length)];
+                    ctx.save();
+                    ctx.shadowColor = col;
+                    ctx.shadowBlur = 8 + Math.random() * 12;
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.arc(x, y, 1 + Math.random() * 1.2, 0, Math.PI * 2);
+                    ctx.fill();
+                    // Cross sparkle
+                    ctx.strokeStyle = `rgba(255, 255, 255, ${0.2 + Math.random() * 0.3})`;
+                    ctx.lineWidth = 0.5;
+                    const sparkLen = 4 + Math.random() * 6;
+                    ctx.beginPath();
+                    ctx.moveTo(x - sparkLen, y); ctx.lineTo(x + sparkLen, y);
+                    ctx.moveTo(x, y - sparkLen); ctx.lineTo(x, y + sparkLen);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            return texture;
+        }
+
+        // --- Generate procedural wood texture ---
+        function generateWoodTexture() {
+            const size = 1024;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+
+            // Base wood color
+            ctx.fillStyle = '#c89b5e';
+            ctx.fillRect(0, 0, size, size);
+
+            // Seed a simple pseudo-random
+            let seed = 42;
+            function rand() { seed = (seed * 16807 + 0) % 2147483647; return (seed - 1) / 2147483646; }
+
+            // Draw wood grain lines
+            for (let i = 0; i < 80; i++) {
+                const y = rand() * size;
+                const thickness = rand() * 3 + 0.5;
+                const alpha = rand() * 0.3 + 0.05;
+                const dark = rand() > 0.5;
+                ctx.strokeStyle = dark
+                    ? `rgba(90, 55, 20, ${alpha})`
+                    : `rgba(180, 140, 80, ${alpha})`;
+                ctx.lineWidth = thickness;
+                ctx.beginPath();
+                let x = 0;
+                ctx.moveTo(x, y);
+                while (x < size) {
+                    x += rand() * 60 + 20;
+                    const yOff = y + (rand() - 0.5) * 12;
+                    ctx.lineTo(x, yOff);
+                }
+                ctx.stroke();
+            }
+
+            // Add some knots
+            for (let k = 0; k < 6; k++) {
+                const kx = rand() * size;
+                const ky = rand() * size;
+                const kr = rand() * 30 + 10;
+                const grad = ctx.createRadialGradient(kx, ky, 0, kx, ky, kr);
+                grad.addColorStop(0, 'rgba(80, 45, 15, 0.4)');
+                grad.addColorStop(0.5, 'rgba(100, 60, 25, 0.2)');
+                grad.addColorStop(1, 'rgba(180, 140, 80, 0)');
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.ellipse(kx, ky, kr, kr * 0.6, rand() * Math.PI, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Rings around knot
+                for (let r = 0; r < 4; r++) {
+                    const ringR = kr + r * 8 + rand() * 5;
+                    ctx.strokeStyle = `rgba(90, 55, 20, ${0.1 + rand() * 0.1})`;
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.ellipse(kx, ky, ringR, ringR * 0.5, rand() * 0.3, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+            }
+
+            // Fine noise overlay
+            const imgData = ctx.getImageData(0, 0, size, size);
+            const d = imgData.data;
+            for (let i = 0; i < d.length; i += 4) {
+                const noise = (rand() - 0.5) * 15;
+                d[i] = Math.min(255, Math.max(0, d[i] + noise));
+                d[i + 1] = Math.min(255, Math.max(0, d[i + 1] + noise));
+                d[i + 2] = Math.min(255, Math.max(0, d[i + 2] + noise));
+            }
+            ctx.putImageData(imgData, 0, 0);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.repeat.set(8, 8);
+            return texture;
+        }
+
+        // --- Results panel ---
+        function addResultToPanel(faceNumber) {
+            const panel = document.getElementById('results');
+
+            // Demote previous "latest" items
+            const prev = panel.querySelectorAll('.result-item.latest');
+            prev.forEach(el => el.classList.remove('latest'));
+
+            // Scale down older items
+            const items = panel.querySelectorAll('.result-item');
+            items.forEach((el, i) => {
+                const age = items.length - i;
+                el.style.opacity = Math.max(0.3, 1 - age * 0.12);
+                el.style.transform = `scale(${Math.max(0.65, 1 - age * 0.06)})`;
+            });
+
+            // Create new result entry
+            const div = document.createElement('div');
+            div.className = 'result-item latest';
+            div.textContent = `🎲 ${faceNumber}`;
+            panel.appendChild(div);
+
+            // Keep max 10 results
+            while (panel.children.length > 10) {
+                panel.removeChild(panel.firstChild);
+            }
+        }
+    </script>
+</body>
+</html>
