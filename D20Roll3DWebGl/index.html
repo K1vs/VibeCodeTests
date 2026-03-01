@@ -295,6 +295,140 @@
                 if (Math.sqrt(dx * dx + dy * dy + dz * dz * 10000) < 10) return;
                 throwDice(dx, dy, dz, dt);
             });
+
+            // --- Touch support ---
+            // 1 finger = swipe throw (LMB), 2 fingers = orbit + pinch depth/zoom
+            const touch2 = { active: false, prevX: 0, prevY: 0, prevDist: 0 };
+
+            function getTouchCenter(touches) {
+                return {
+                    x: (touches[0].clientX + touches[1].clientX) / 2,
+                    y: (touches[0].clientY + touches[1].clientY) / 2
+                };
+            }
+            function getTouchDist(touches) {
+                const dx = touches[0].clientX - touches[1].clientX;
+                const dy = touches[0].clientY - touches[1].clientY;
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+
+            renderer.domElement.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+
+                if (e.touches.length === 2) {
+                    // Two-finger gesture starts — cancel any ongoing 1-finger drag
+                    if (mouse.isDown) {
+                        mouse.isDown = false;
+                        if (arrow) { scene.remove(arrow); arrow = null; }
+                    }
+                    const c = getTouchCenter(e.touches);
+                    touch2.active = true;
+                    touch2.prevX = c.x;
+                    touch2.prevY = c.y;
+                    touch2.prevDist = getTouchDist(e.touches);
+                    return;
+                }
+
+                if (e.touches.length !== 1) return;
+
+                // After result shown, tap to prepare new throw
+                if (awaitingRethrow) {
+                    awaitingRethrow = false;
+                    resultShown = false;
+                    resultPending = null;
+                    alignTimer = 0;
+                    settleTimer = 0;
+                    targetCamTheta = null;
+                    const startPos = new THREE.Vector3(0, 2.5, 0);
+                    physics.setMeshPosition(cube, startPos);
+                    physics.setMeshVelocity(cube, new THREE.Vector3(0, 0, 0));
+                    randomizeDieRotation();
+                    camState.targetPhi = 75;
+                    camState.phi = 75;
+                    camState.theta = 0;
+                    camState.radius = 6;
+                    holdInPlace = true;
+                    // Don't start drag on this tap — just reset, next swipe will throw
+                    return;
+                }
+
+                mouse.startX = e.touches[0].clientX;
+                mouse.startY = e.touches[0].clientY;
+                mouse.curX = e.touches[0].clientX;
+                mouse.curY = e.touches[0].clientY;
+                mouse.depth = 0;
+                mouse.startTime = performance.now();
+                mouse.isDown = true;
+            }, { passive: false });
+
+            renderer.domElement.addEventListener('touchmove', (e) => {
+                e.preventDefault();
+
+                if (e.touches.length === 2 && touch2.active) {
+                    // Two-finger drag → orbit camera
+                    const c = getTouchCenter(e.touches);
+                    const dx = c.x - touch2.prevX;
+                    const dy = c.y - touch2.prevY;
+                    camState.theta += dx * 0.3;
+                    camState.phi = THREE.MathUtils.clamp(camState.phi - dy * 0.3, 5, 85);
+                    touch2.prevX = c.x;
+                    touch2.prevY = c.y;
+
+                    // Pinch → depth (during throw drag) or zoom (idle/orbit)
+                    const dist = getTouchDist(e.touches);
+                    const pinchDelta = dist - touch2.prevDist;
+                    if (mouse.isDown) {
+                        // During a throw drag, pinch controls depth like scroll wheel
+                        mouse.depth += pinchDelta * 0.02;
+                        mouse.depth = THREE.MathUtils.clamp(mouse.depth, -5, 5);
+                        update3DArrow();
+                    } else {
+                        // Otherwise pinch zooms camera
+                        camState.radius = THREE.MathUtils.clamp(camState.radius - pinchDelta * 0.02, 3, 20);
+                    }
+                    touch2.prevDist = dist;
+                    return;
+                }
+
+                if (!mouse.isDown || e.touches.length !== 1) return;
+                mouse.curX = e.touches[0].clientX;
+                mouse.curY = e.touches[0].clientY;
+                update3DArrow();
+            }, { passive: false });
+
+            renderer.domElement.addEventListener('touchend', (e) => {
+                e.preventDefault();
+
+                // If two-finger gesture ended
+                if (touch2.active && e.touches.length < 2) {
+                    touch2.active = false;
+                    // If one finger remains, don't start a new throw from it
+                    return;
+                }
+
+                if (!mouse.isDown) return;
+                if (e.touches.length > 0) return; // still has fingers down
+                mouse.isDown = false;
+                if (arrow) {
+                    scene.remove(arrow);
+                    arrow = null;
+                }
+                const dt = Math.max((performance.now() - mouse.startTime) / 1000, 0.016);
+                const dx = mouse.curX - mouse.startX;
+                const dy = mouse.curY - mouse.startY;
+                const dz = mouse.depth;
+                if (Math.sqrt(dx * dx + dy * dy + dz * dz * 10000) < 10) return;
+                throwDice(dx, dy, dz, dt);
+            }, { passive: false });
+
+            renderer.domElement.addEventListener('touchcancel', () => {
+                mouse.isDown = false;
+                touch2.active = false;
+                if (arrow) {
+                    scene.remove(arrow);
+                    arrow = null;
+                }
+            });
         }
 
         // Get camera-relative world direction from screen drag
