@@ -24,6 +24,11 @@
             pointer-events: none;
             text-shadow: 0 0 4px rgba(255,255,255,0.5);
         }
+        #info .touch-info {
+            font-size: 12px;
+            opacity: 0.7;
+            margin-top: 2px;
+        }
         #results {
             position: absolute;
             top: 10px;
@@ -57,7 +62,10 @@
     </style>
 </head>
 <body>
-    <div id="info">D20 Dice Roll — Drag to aim, scroll for depth, release to throw</div>
+    <div id="info">
+        <div>D20 Dice Roll — Drag to aim, scroll for depth, release to throw</div>
+        <div class="touch-info">Touch: swipe to throw · two fingers drag to orbit · pinch to zoom/depth</div>
+    </div>
     <div id="results"></div>
 
     <script type="importmap">
@@ -171,7 +179,7 @@
             randomizeDieRotation();
 
             // --- Ground (wood-textured surface where dice lands) ---
-            const groundGeometry = new THREE.BoxGeometry(100, 0.2, 100);
+            const groundGeometry = new THREE.BoxGeometry(200, 0.2, 200);
             const woodTexture = generateWoodTexture();
             const groundMaterial = new THREE.MeshStandardMaterial({
                 map: woodTexture,
